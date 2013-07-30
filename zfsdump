@@ -1,0 +1,76 @@
+#!/bin/sh -e
+PATH=/bin:/sbin:/usr/bin:/usr/sbin
+
+# Dump a zfs filesystem in the style of BSD dump.
+
+# Config settings.
+# Snapshot used for a dump in progress.
+WORK=zfsdump-working
+# Prepended to the name of a snapshot at a given level.
+PREFIX=zfsdump-level
+
+# Parse command line args.
+if [ $# -ne 2 ] ; then
+    echo "Usage: $0 filesystem level" >&2
+    exit 1
+fi
+fs=$1
+level=$2
+if ! [ $level -ge 0 ] ; then
+    echo "$0: level $level must be a non-negative integer" >&2
+    exit 1
+fi
+if ! zfs list -H | awk '{print $1}' | grep -qE "^${fs}\$" ; then
+    echo "$0: fs $fs doesn't exist" >&2
+    exit 1
+fi
+
+# Create a working snapshot. If it already exists, abort.
+zfs snapshot ${fs}@${WORK}
+
+# Look for a lower-level snapshot. If it exists, we'll do our dump as
+# an incremental relative to it.
+prevdump=`zfs list -H -t snapshot | \
+    awk '{print $1}' | \
+    grep -E "^${fs}@${PREFIX}.*\$" | \
+    sed "s,^${fs}@${PREFIX},," | \
+    while read l ; do
+    if [ $l -lt $level ] ; then
+	echo $l
+    fi
+done | \
+    sort -nr | \
+    head -1`
+if [ -z "$prevdump" ] ; then
+    echo -n "Doing a full dump" >&2
+    if [ $level != 0 ] ; then
+	echo -n " (no previous dump found)" >&2
+    fi
+    echo "." >&2
+else
+    echo "Previous dump was at level ${prevdump}." >&2
+fi
+
+# Dump incremental or full.
+if [ -n "$prevdump" ] ; then
+    incr="-i ${PREFIX}${prevdump}"
+fi
+zfs send $incr ${fs}@${WORK}
+
+# Rename working snapshot to match PREFIX. First delete the existing
+# snapshot of this level, if it exists.
+zfs destroy ${fs}@${PREFIX}${level} 2>/dev/null || true
+zfs rename ${fs}@${WORK} ${fs}@${PREFIX}${level}
+echo "Success." >&2
+
+# Delete any snapshots of a higher level than this one.
+zfs list -H -t snapshot | \
+    awk '{print $1}' | \
+    grep -E "^${fs}@${PREFIX}.*\$" | \
+    sed "s,^${fs}@${PREFIX},," | \
+    while read l ; do
+    if [ $l -gt $level ] ; then
+	zfs destroy ${fs}@${PREFIX}${l}
+	echo "Removed old snapshot ${fs}@${PREFIX}${l}" >&2
+    fi
+done
